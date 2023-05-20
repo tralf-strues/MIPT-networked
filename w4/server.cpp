@@ -5,9 +5,30 @@
 #include <stdlib.h>
 #include <vector>
 #include <map>
+#include <cmath>
 
+static const size_t kAiEntities = 8;
 static std::vector<Entity> entities;
 static std::map<uint16_t, ENetPeer*> controlledMap;
+
+float random_coord_on_map() {
+  return (rand() % 4) * 200.f - 300.0f;
+}
+
+Entity& spawn_new_entity(uint16_t eid, ENetPeer *peer)
+{
+  uint32_t color = 0xff000000 +
+                   0x00440000 * (rand() % 5) +
+                   0x00004400 * (rand() % 5) +
+                   0x00000044 * (rand() % 5);
+  float x = random_coord_on_map();
+  float y = random_coord_on_map();
+  Entity& ent = entities.emplace_back(color, x, y, eid);
+
+  controlledMap[eid] = peer;
+
+  return ent;
+}
 
 void on_join(ENetPacket *packet, ENetPeer *peer, ENetHost *host)
 {
@@ -20,17 +41,8 @@ void on_join(ENetPacket *packet, ENetPeer *peer, ENetHost *host)
   for (const Entity &e : entities)
     maxEid = std::max(maxEid, e.eid);
   uint16_t newEid = maxEid + 1;
-  uint32_t color = 0xff000000 +
-                   0x00440000 * (rand() % 5) +
-                   0x00004400 * (rand() % 5) +
-                   0x00000044 * (rand() % 5);
-  float x = (rand() % 4) * 200.f;
-  float y = (rand() % 4) * 200.f;
-  Entity ent = {color, x, y, newEid};
-  entities.push_back(ent);
-
-  controlledMap[newEid] = peer;
-
+  
+  Entity& ent = spawn_new_entity(newEid, peer);
 
   // send info about new entity to everyone
   for (size_t i = 0; i < host->peerCount; ++i)
@@ -50,6 +62,89 @@ void on_state(ENetPacket *packet)
       e.x = x;
       e.y = y;
     }
+}
+
+void spawn_ai_entities()
+{
+  for (size_t i = 0; i < kAiEntities; ++i)
+  {
+    Entity& entity = spawn_new_entity(i, nullptr);
+    entity.radius = (rand() % 3) * 5.f + 5.0f;
+  }
+}
+
+void move_ai_entities(float dt)
+{
+  for (auto& entity : entities) {
+    if (controlledMap[entity.eid] == nullptr) {
+      float v_x = entity.target_x - entity.x;
+      float v_y = entity.target_y - entity.y;
+
+      float length = std::sqrtf(v_x * v_x + v_y * v_y);
+      if (length != 0.0f) {
+        v_x = 100.0f * v_x / length;
+        v_y = 100.0f * v_y / length;
+      }
+
+      entity.x += v_x * dt;
+      entity.y += v_y * dt;
+
+      float to_target = (entity.target_x - entity.x) * (entity.target_x - entity.x) +
+                        (entity.target_y - entity.y) * (entity.target_y - entity.y);
+
+      if (to_target < 0.001f) {
+        entity.radius = (rand() % 3) * 5.f + 5.0f;
+
+        entity.target_x = random_coord_on_map();
+        entity.target_y = random_coord_on_map();
+      }
+    }
+  }
+}
+
+void check_collisions() {
+  for (auto& first : entities)
+  {
+    for (auto& second : entities)
+    {
+      if (first.eid == second.eid) { continue; }
+
+      auto* small = &first;
+      auto* big = &second;
+      if (big->radius < small->radius)
+      {
+        small = &second;
+        big = &first;
+      }
+
+      float distance = (big->x - small->x) * (big->x - small->x) +
+                       (big->y - small->y) * (big->y - small->y);
+
+      if (distance <= big->radius * big->radius)
+      {
+        small->radius /= 2.0f;
+        big->radius += small->radius;
+
+        small->x = random_coord_on_map();
+        small->y = random_coord_on_map();
+
+        if (controlledMap[small->eid] != nullptr)
+        {
+          send_snapshot(controlledMap[small->eid], small->eid, small->x, small->y, small->radius);
+        }
+        else
+        {
+          small->target_x = random_coord_on_map();
+          small->target_y = random_coord_on_map();
+        }
+
+        if (controlledMap[big->eid] != nullptr)
+        {
+          send_snapshot(controlledMap[big->eid], big->eid, big->x, big->y, big->radius);
+        }
+      }
+    }
+  }
 }
 
 int main(int argc, const char **argv)
@@ -72,8 +167,14 @@ int main(int argc, const char **argv)
     return 1;
   }
 
+  spawn_ai_entities();
+
+  clock_t time_start = clock();
   while (true)
   {
+    float dt = (0.0f + clock() - time_start) / CLOCKS_PER_SEC;
+    time_start = clock();
+
     ENetEvent event;
     while (enet_host_service(server, &event, 0) > 0)
     {
@@ -98,13 +199,17 @@ int main(int argc, const char **argv)
         break;
       };
     }
+
+    move_ai_entities(dt);
+    check_collisions();
+
     static int t = 0;
     for (const Entity &e : entities)
       for (size_t i = 0; i < server->peerCount; ++i)
       {
         ENetPeer *peer = &server->peers[i];
         if (controlledMap[e.eid] != peer)
-          send_snapshot(peer, e.eid, e.x, e.y);
+          send_snapshot(peer, e.eid, e.x, e.y, e.radius);
       }
     //usleep(400000);
   }
