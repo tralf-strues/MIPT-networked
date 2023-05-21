@@ -7,8 +7,11 @@
 #include <vector>
 #include <map>
 
+#include "time.hpp"
+
 static std::vector<Entity> entities;
 static std::map<uint16_t, ENetPeer*> controlledMap;
+static std::map<uint16_t, std::vector<InputSnapshot>> inputQueues;
 
 void on_join(ENetPacket *packet, ENetPeer *peer, ENetHost *host)
 {
@@ -42,15 +45,10 @@ void on_join(ENetPacket *packet, ENetPeer *peer, ENetHost *host)
 
 void on_input(ENetPacket *packet)
 {
-  uint16_t eid = invalid_entity;
-  float thr = 0.f; float steer = 0.f;
-  deserialize_entity_input(packet, eid, thr, steer);
-  for (Entity &e : entities)
-    if (e.eid == eid)
-    {
-      e.thr = thr;
-      e.steer = steer;
-    }
+  InputSnapshot input{};
+  deserialize_entity_input(packet, input);
+
+  inputQueues[input.eid].push_back(input);
 }
 
 int main(int argc, const char **argv)
@@ -73,12 +71,12 @@ int main(int argc, const char **argv)
     return 1;
   }
 
-  uint32_t lastTime = enet_time_get();
+  printf("Server's fixed update is every %lu ms (%lu times per second)\n", kServerFixedTimeStep, kServerUpdatesPerSecond);
+
   while (true)
   {
     uint32_t curTime = enet_time_get();
-    float dt = (curTime - lastTime) * 0.001f;
-    lastTime = curTime;
+
     ENetEvent event;
     while (enet_host_service(server, &event, 0) > 0)
     {
@@ -103,21 +101,36 @@ int main(int argc, const char **argv)
         break;
       };
     }
-    static int t = 0;
+
     for (Entity &e : entities)
     {
       // simulate
-      simulate_entity(e, dt);
+      for (const auto& input : inputQueues[e.eid]) {
+        e.thr = input.thr;
+        e.steer = input.steer;
+        simulate_entity(e, input.dt);
+      }
+
+      inputQueues[e.eid].clear();
+      
+      ++e.gen;
+
       // send
       for (size_t i = 0; i < server->peerCount; ++i)
       {
         ENetPeer *peer = &server->peers[i];
-        // skip this here in this implementation
-        //if (controlledMap[e.eid] != peer)
-        send_snapshot(peer, e.eid, e.x, e.y, e.ori);
+
+        EntitySnapshot snapshot{};
+        snapshot.x = e.x;
+        snapshot.y = e.y;
+        snapshot.ori = e.ori;
+        snapshot.eid = e.eid;
+        snapshot.gen = e.gen;
+        send_snapshot(peer, snapshot);
       }
     }
-    usleep(100000);
+
+    usleep(kServerFixedTimeStep * 1000u);
   }
 
   enet_host_destroy(server);

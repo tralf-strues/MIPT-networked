@@ -11,12 +11,15 @@ SET(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(W5_SOURCES
     main.cpp
     protocol.cpp
+    entity.cpp
+    bitstream.cpp
     )
 
 set(W5_SERVER_SOURCES
     server.cpp
     protocol.cpp
     entity.cpp
+    bitstream.cpp
     )
 
 

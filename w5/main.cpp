@@ -5,13 +5,27 @@
 #include <enet/enet.h>
 #include <math.h>
 
+#include <deque>
 #include <vector>
+#include <unordered_map>
 #include "entity.h"
 #include "protocol.h"
+#include "time.hpp"
+#include <cmath>
 
+static std::unordered_map<uint16_t, std::deque<EntitySnapshot>> entitySnapshots;
+static std::unordered_map<uint16_t, uint32_t> lastUpdateTime;
+
+static std::vector<InputSnapshot> playerInputSnapshots;
+
+static uint32_t inputGen = 0;
 
 static std::vector<Entity> entities;
 static uint16_t my_entity = invalid_entity;
+
+bool FloatsEqual(float a, float b) {
+  return std::fabs(a - b) < 0.001f;
+}
 
 void on_new_entity_packet(ENetPacket *packet)
 {
@@ -29,19 +43,82 @@ void on_set_controlled_entity(ENetPacket *packet)
   deserialize_set_controlled_entity(packet, my_entity);
 }
 
+void local_simulation_rollback(const EntitySnapshot& snapshot)
+{
+  Entity& e = entities[my_entity];
+  e.x = snapshot.x;
+  e.y = snapshot.y;
+  e.ori = snapshot.ori;
+  e.gen = snapshot.gen;
+
+  size_t inputs_size = playerInputSnapshots.size();
+  if (inputs_size > 0) {
+    size_t idx = inputs_size - 1;
+    for (; idx > 0 && playerInputSnapshots[idx].gen >= snapshot.gen; --idx) { ; }
+
+    for (; idx < inputs_size; ++idx) {
+      e.thr = playerInputSnapshots[idx].thr;
+      e.steer = playerInputSnapshots[idx].steer;
+
+      simulate_entity(e, playerInputSnapshots[idx].dt);
+    }
+  }
+}
+
 void on_snapshot(ENetPacket *packet)
 {
-  uint16_t eid = invalid_entity;
-  float x = 0.f; float y = 0.f; float ori = 0.f;
-  deserialize_snapshot(packet, eid, x, y, ori);
+  EntitySnapshot snapshot{};
+  deserialize_snapshot(packet, snapshot);
+
+  auto& snapshots = entitySnapshots[snapshot.eid];
+
+  if (snapshots.empty() || snapshots.back().gen < snapshot.gen) {
+    snapshots.push_back(snapshot);
+  }
+
+  lastUpdateTime[snapshot.eid] = enet_time_get();
+
   // TODO: Direct adressing, of course!
   for (Entity &e : entities)
-    if (e.eid == eid)
+    if (e.eid == snapshot.eid)
     {
-      e.x = x;
-      e.y = y;
-      e.ori = ori;
+      if (e.eid == my_entity) {
+        if (!FloatsEqual(e.x, snapshot.x) || !FloatsEqual(e.y, snapshot.y) || !FloatsEqual(e.ori, snapshot.ori)) {
+          local_simulation_rollback(snapshot);
+        }
+        continue;
+      }
+
+      e.x = snapshot.x;
+      e.y = snapshot.y;
+      e.ori = snapshot.ori;
+      e.gen = snapshot.gen;
     }
+}
+
+float lerp(float a, float b, float t) {
+  return a + t * (b - a);
+}
+
+void interpolate_entities(uint32_t cur_time)
+{
+  for (auto& [eid, snapshots] : entitySnapshots)
+  {
+    if (eid == my_entity) { continue; }
+
+    auto& entity = entities[eid];
+
+    if (snapshots.size() > 2)
+    {
+      const auto& first = *(snapshots.end() - 2);
+      const auto& second = *(snapshots.end() - 1);
+
+      float t = (cur_time - lastUpdateTime[eid]) * (second.gen - first.gen) / kServerFixedTimeStepF;
+      entity.x = lerp(first.x, second.x, t);
+      entity.y = lerp(first.y, second.y, t);
+      entity.ori = lerp(first.ori, second.ori, t);
+    }
+  }
 }
 
 int main(int argc, const char **argv)
@@ -90,13 +167,14 @@ int main(int argc, const char **argv)
   camera.rotation = 0.f;
   camera.zoom = 10.f;
 
-
   SetTargetFPS(60);               // Set our game to run at 60 frames-per-second
 
   bool connected = false;
+  uint32_t lastSimulationTime = enet_time_get();
   while (!WindowShouldClose())
   {
     float dt = GetFrameTime();
+    uint32_t curTime = enet_time_get();
     ENetEvent event;
     while (enet_host_service(client, &event, 0) > 0)
     {
@@ -127,12 +205,18 @@ int main(int argc, const char **argv)
     }
     if (my_entity != invalid_entity)
     {
+      uint32_t gens_passed = (curTime - lastSimulationTime) / kServerFixedTimeStep;
+      if (gens_passed > 0) {
+        lastSimulationTime = curTime;
+      }
+
       bool left = IsKeyDown(KEY_LEFT);
       bool right = IsKeyDown(KEY_RIGHT);
       bool up = IsKeyDown(KEY_UP);
       bool down = IsKeyDown(KEY_DOWN);
       // TODO: Direct adressing, of course!
       for (Entity &e : entities)
+      {
         if (e.eid == my_entity)
         {
           // Update
@@ -140,9 +224,26 @@ int main(int argc, const char **argv)
           float steer = (left ? -1.f : 0.f) + (right ? 1.f : 0.f);
 
           // Send
-          send_entity_input(serverPeer, my_entity, thr, steer);
+          InputSnapshot input{};
+          input.eid = my_entity;
+          input.input_num = inputGen++;
+          input.thr = thr;
+          input.steer = steer;
+          input.dt = dt;
+          input.gen = e.gen;
+          send_entity_input(serverPeer, input);
+
+          playerInputSnapshots.push_back(input);
+
+          e.thr = thr;
+          e.steer = steer;
+          e.gen += gens_passed;
+          simulate_entity(e, dt);
         }
+      }
     }
+
+    interpolate_entities(curTime);
 
     BeginDrawing();
       ClearBackground(GRAY);
